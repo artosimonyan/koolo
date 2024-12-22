@@ -11,15 +11,15 @@
 <body>
 <main class="container">
     {{ if ne .ErrorMessage "" }}
-    <div class="container">
-        <div class="row">
-            <div class="col">
-                <div class="error-message">
-                    {{ .ErrorMessage }}
+        <div class="container">
+            <div class="row">
+                <div class="col">
+                    <div class="error-message">
+                        {{ .ErrorMessage }}
+                    </div>
                 </div>
             </div>
         </div>
-    </div>
     {{ end }}
     <div class="notification">
         <h2>Settings</h2>
@@ -108,7 +108,7 @@
                     />
                     Enabled (Restart required)
                 </label>
-                 <input
+                <input
                         name="discord_admins"
                         placeholder="Discord User IDs who can use bot commands separated by commas"
                         value="{{.Discord.BotAdmins}}"

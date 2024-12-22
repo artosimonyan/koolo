@@ -14,30 +14,31 @@ type Data struct {
 	Areas    map[area.ID]AreaData `json:"-"`
 	AreaData AreaData             `json:"-"`
 	data.Data
-	CharacterCfg config.CharacterCfg
+	CharacterCfg config.CharacterCfg // Keep as value type for thread safety
 }
 
 func (d Data) CanTeleport() bool {
-    if !d.CharacterCfg.Character.UseTeleport {
-        return false
-    }
-// In Duriel Lair we can teleport only in boss room
-// Only enable Teleport in largest room where is Duriel
-    if d.PlayerUnit.Area == area.DurielsLair {
-        if len(d.AreaData.Rooms) > 0 {
-            bossRoom := d.AreaData.Rooms[0]
-            for _, room := range d.AreaData.Rooms {
-                if (room.Width * room.Height) > (bossRoom.Width * bossRoom.Height) {
-                    bossRoom = room
-                }
-            }
-            return bossRoom.IsInside(d.PlayerUnit.Position)
-        }
-        return false
-    }
+	if !d.CharacterCfg.Character.UseTeleport {
+		return false
+	}
 
-    _, isTpBound := d.KeyBindings.KeyBindingForSkill(skill.Teleport)
-    return isTpBound && !d.PlayerUnit.Area.IsTown()
+	// In Duriel Lair we can teleport only in boss room
+	// Only enable Teleport in largest room where is Duriel
+	if d.PlayerUnit.Area == area.DurielsLair {
+		if len(d.AreaData.Rooms) > 0 {
+			bossRoom := d.AreaData.Rooms[0]
+			for _, room := range d.AreaData.Rooms {
+				if (room.Width * room.Height) > (bossRoom.Width * bossRoom.Height) {
+					bossRoom = room
+				}
+			}
+			return bossRoom.IsInside(d.PlayerUnit.Position)
+		}
+		return false
+	}
+
+	_, isTpBound := d.KeyBindings.KeyBindingForSkill(skill.Teleport)
+	return isTpBound && !d.PlayerUnit.Area.IsTown()
 }
 
 func (d Data) PlayerCastDuration() time.Duration {
@@ -54,7 +55,6 @@ func (d Data) MonsterFilterAnyReachable() data.MonsterFilter {
 				filtered = append(filtered, m)
 			}
 		}
-
 		return filtered
 	}
 }

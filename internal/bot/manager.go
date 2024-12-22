@@ -27,6 +27,11 @@ type SupervisorManager struct {
 	crashDetectors map[string]*game.CrashDetector
 	eventListener  *event.Listener
 }
+type ConfigReloadResult struct {
+	Success      bool
+	ReloadErrors map[string]error
+	GlobalError  error
+}
 
 func NewSupervisorManager(logger *slog.Logger, eventListener *event.Listener) *SupervisorManager {
 	return &SupervisorManager{
@@ -356,4 +361,41 @@ func (mng *SupervisorManager) rearrangeWindows() {
 			mng.logger.Debug("Window position of supervisor " + sp.Name() + " was not changed, no free space for it")
 		}
 	}
+}
+
+func (mng *SupervisorManager) ReloadConfig() ConfigReloadResult {
+	result := ConfigReloadResult{
+		Success:      true,
+		ReloadErrors: make(map[string]error),
+	}
+
+	// Load fresh configs
+	if err := config.Load(); err != nil {
+		return ConfigReloadResult{
+			Success:     false,
+			GlobalError: fmt.Errorf("failed to load new configs: %w", err),
+		}
+	}
+
+	// Apply new configs to running supervisors
+	for name, sup := range mng.supervisors {
+		newCfg, exists := config.Characters[name]
+		if !exists {
+			continue
+		}
+
+		ctx := sup.GetContext()
+		if ctx == nil {
+			continue
+		}
+
+		// Preserve runtime data
+		oldRuntimeData := ctx.CharacterCfg.Runtime
+
+		// Update the config
+		*ctx.CharacterCfg = *newCfg
+		ctx.CharacterCfg.Runtime = oldRuntimeData
+	}
+
+	return result
 }

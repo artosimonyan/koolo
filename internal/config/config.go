@@ -6,11 +6,10 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/hectorgimenez/d2go/pkg/data"
-	"github.com/hectorgimenez/koolo/internal/utils"
-
 	"os"
 	"strings"
+
+	"github.com/hectorgimenez/d2go/pkg/data"
 
 	"github.com/hectorgimenez/d2go/pkg/data/area"
 	"github.com/hectorgimenez/d2go/pkg/data/difficulty"
@@ -275,97 +274,50 @@ func (bm BeltColumns) Total(potionType data.PotionType) int {
 func Load() error {
 	Characters = make(map[string]*CharacterCfg)
 
-	// Get the absolute path of the current working directory
-	cwd, err := os.Getwd()
-	if err != nil {
-		return fmt.Errorf("error getting current working directory: %w", err)
-	}
-
-	// Function to get absolute path
-	getAbsPath := func(relPath string) string {
-		return filepath.Join(cwd, relPath)
-	}
-
-	kooloPath := getAbsPath("config/koolo.yaml")
-	r, err := os.Open(kooloPath)
+	// Load main koolo config
+	koolo, err := os.Open("config/koolo.yaml")
 	if err != nil {
 		return fmt.Errorf("error loading koolo.yaml: %w", err)
 	}
-	defer r.Close()
+	defer koolo.Close()
 
-	d := yaml.NewDecoder(r)
-	if err = d.Decode(&Koolo); err != nil {
-		return fmt.Errorf("error reading config %s: %w", kooloPath, err)
-	}
-
-	configDir := getAbsPath("config")
-	entries, err := os.ReadDir(configDir)
-	if err != nil {
-		return fmt.Errorf("error reading config directory %s: %w", configDir, err)
+	if err = yaml.NewDecoder(koolo).Decode(&Koolo); err != nil {
+		return fmt.Errorf("error reading koolo.yaml: %w", err)
 	}
 
 	// Read character configs
+	entries, err := os.ReadDir("config")
+	if err != nil {
+		return fmt.Errorf("error reading config directory: %w", err)
+	}
+
 	for _, entry := range entries {
 		if !entry.IsDir() || entry.Name() == "template" {
 			continue
 		}
 
-		charCfg := CharacterCfg{}
-
-		// Load character config from the current working directory/config/{charName}/config.yaml
-		charConfigPath := getAbsPath(filepath.Join("config", entry.Name(), "config.yaml"))
-		r, err = os.Open(charConfigPath)
-		if err != nil {
-			return fmt.Errorf("error loading config.yaml: %w", err)
-		}
-		defer r.Close()
-
 		// Load character config
-		d := yaml.NewDecoder(r)
-		if err = d.Decode(&charCfg); err != nil {
+		charConfigPath := filepath.Join("config", entry.Name(), "config.yaml")
+		cfgFile, err := os.Open(charConfigPath)
+		if err != nil {
+			return fmt.Errorf("error loading config.yaml for %s: %w", entry.Name(), err)
+		}
+		defer cfgFile.Close()
+
+		var charCfg CharacterCfg
+		if err := yaml.NewDecoder(cfgFile).Decode(&charCfg); err != nil {
 			return fmt.Errorf("error reading %s character config: %w", charConfigPath, err)
 		}
 
-		var pickitPath string
-
-		if Koolo.CentralizedPickitPath != "" && charCfg.UseCentralizedPickit {
-			// Validate centralized pickit path
-			if _, err := os.Stat(Koolo.CentralizedPickitPath); os.IsNotExist(err) {
-				utils.ShowDialog("Error loading pickit rules for "+entry.Name(), "The centralized pickit path does not exist: "+Koolo.CentralizedPickitPath+"\nPlease check your Koolo settings.\nFalling back to local pickit.")
-
-				// Set the pickit path to the current dir/config/{charName}/pickit
-				pickitPath = getAbsPath(filepath.Join("config", entry.Name(), "pickit")) + "\\"
-			} else {
-				pickitPath = Koolo.CentralizedPickitPath + "\\"
-			}
-		} else {
-			// Set the pickit path to the current dir/config/{charName}/pickit
-			pickitPath = getAbsPath(filepath.Join("config", entry.Name(), "pickit")) + "\\"
-		}
-
-		// Load the pickit rules from the directory
-		rules, err := nip.ReadDir(pickitPath)
+		// Load pickit rules
+		pickitPath := filepath.Join("config", entry.Name(), "pickit")
+		rules, err := nip.ReadDir(pickitPath + "\\")
 		if err != nil {
 			return fmt.Errorf("error reading pickit directory %s: %w", pickitPath, err)
 		}
 
-		// Load the leveling pickit rules
-		if len(charCfg.Game.Runs) > 0 && charCfg.Game.Runs[0] == "leveling" {
-			levelingPickitPath := getAbsPath(filepath.Join("config", entry.Name(), "pickit_leveling")) + "\\"
-			levelingRules, err := nip.ReadDir(levelingPickitPath)
-			if err != nil {
-				return fmt.Errorf("error reading pickit_leveling directory %s: %w", levelingPickitPath, err)
-			}
-			rules = append(rules, levelingRules...)
-		}
-
 		charCfg.Runtime.Rules = rules
 		Characters[entry.Name()] = &charCfg
-	}
-
-	// Validate configs
-	for _, charCfg := range Characters {
-		charCfg.Validate()
 	}
 
 	return nil
