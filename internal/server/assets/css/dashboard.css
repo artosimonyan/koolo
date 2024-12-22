@@ -5,8 +5,8 @@
     --card-background-color: #22262e;
     --card-hover-background-color: #2a2f38;
 }
-body { 
-    padding: 20px; 
+body {
+    padding: 20px;
     background-color: var(--background-color);
 }
 .dashboard-header {
@@ -213,8 +213,8 @@ body {
     margin-bottom: 10px;
 }
 .run-stats h3 {
-margin-top: 20px;
-color: var(--primary);
+    margin-top: 20px;
+    color: var(--primary);
 }
 .run-stats-grid {
     display: grid;
@@ -512,4 +512,17 @@ stat-value {
 @keyframes spin {
     0% { transform: rotate(0deg); }
     100% { transform: rotate(360deg); }
+}
+
+.rotate {
+    animation: rotation 1s infinite linear;
+}
+
+@keyframes rotation {
+    from {
+        transform: rotate(0deg);
+    }
+    to {
+        transform: rotate(359deg);
+    }
 }

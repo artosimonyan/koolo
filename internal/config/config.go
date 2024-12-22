@@ -6,10 +6,10 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/hectorgimenez/d2go/pkg/data"
-
 	"os"
 	"strings"
+
+	"github.com/hectorgimenez/d2go/pkg/data"
 
 	"github.com/hectorgimenez/d2go/pkg/data/area"
 	"github.com/hectorgimenez/d2go/pkg/data/difficulty"
@@ -40,6 +40,7 @@ type KooloCfg struct {
 	LogSaveDirectory      string `yaml:"logSaveDirectory"`
 	D2LoDPath             string `yaml:"D2LoDPath"`
 	D2RPath               string `yaml:"D2RPath"`
+	CentralizedPickitPath string `yaml:"centralizedPickitPath"`
 	Discord               struct {
 		Enabled                      bool     `yaml:"enabled"`
 		EnableGameCreatedMessages    bool     `yaml:"enableGameCreatedMessages"`
@@ -73,17 +74,18 @@ type TimeRange struct {
 }
 
 type CharacterCfg struct {
-	MaxGameLength   int    `yaml:"maxGameLength"`
-	Username        string `yaml:"username"`
-	Password        string `yaml:"password"`
-	AuthMethod      string `yaml:"authMethod"`
-	AuthToken       string `yaml:"authToken"`
-	Realm           string `yaml:"realm"`
-	CharacterName   string `yaml:"characterName"`
-	CommandLineArgs string `yaml:"commandLineArgs"`
-	KillD2OnStop    bool   `yaml:"killD2OnStop"`
-	ClassicMode     bool   `yaml:"classicMode"`
-	CloseMiniPanel  bool   `yaml:"closeMiniPanel"`
+	MaxGameLength        int    `yaml:"maxGameLength"`
+	Username             string `yaml:"username"`
+	Password             string `yaml:"password"`
+	AuthMethod           string `yaml:"authMethod"`
+	AuthToken            string `yaml:"authToken"`
+	Realm                string `yaml:"realm"`
+	CharacterName        string `yaml:"characterName"`
+	CommandLineArgs      string `yaml:"commandLineArgs"`
+	KillD2OnStop         bool   `yaml:"killD2OnStop"`
+	ClassicMode          bool   `yaml:"classicMode"`
+	CloseMiniPanel       bool   `yaml:"closeMiniPanel"`
+	UseCentralizedPickit bool   `yaml:"useCentralizedPickit"`
 
 	Scheduler Scheduler `yaml:"scheduler"`
 	Health    struct {
@@ -272,74 +274,50 @@ func (bm BeltColumns) Total(potionType data.PotionType) int {
 func Load() error {
 	Characters = make(map[string]*CharacterCfg)
 
-	// Get the absolute path of the current working directory
-	cwd, err := os.Getwd()
-	if err != nil {
-		return fmt.Errorf("error getting current working directory: %w", err)
-	}
-
-	// Function to get absolute path
-	getAbsPath := func(relPath string) string {
-		return filepath.Join(cwd, relPath)
-	}
-
-	kooloPath := getAbsPath("config/koolo.yaml")
-	r, err := os.Open(kooloPath)
+	// Load main koolo config
+	koolo, err := os.Open("config/koolo.yaml")
 	if err != nil {
 		return fmt.Errorf("error loading koolo.yaml: %w", err)
 	}
-	defer r.Close()
+	defer koolo.Close()
 
-	d := yaml.NewDecoder(r)
-	if err = d.Decode(&Koolo); err != nil {
-		return fmt.Errorf("error reading config %s: %w", kooloPath, err)
+	if err = yaml.NewDecoder(koolo).Decode(&Koolo); err != nil {
+		return fmt.Errorf("error reading koolo.yaml: %w", err)
 	}
 
-	configDir := getAbsPath("config")
-	entries, err := os.ReadDir(configDir)
+	// Read character configs
+	entries, err := os.ReadDir("config")
 	if err != nil {
-		return fmt.Errorf("error reading config directory %s: %w", configDir, err)
+		return fmt.Errorf("error reading config directory: %w", err)
 	}
 
 	for _, entry := range entries {
-		if !entry.IsDir() {
+		if !entry.IsDir() || entry.Name() == "template" {
 			continue
 		}
 
-		charCfg := CharacterCfg{}
-		charConfigPath := getAbsPath(filepath.Join("config", entry.Name(), "config.yaml"))
-		r, err = os.Open(charConfigPath)
+		// Load character config
+		charConfigPath := filepath.Join("config", entry.Name(), "config.yaml")
+		cfgFile, err := os.Open(charConfigPath)
 		if err != nil {
-			return fmt.Errorf("error loading config.yaml: %w", err)
+			return fmt.Errorf("error loading config.yaml for %s: %w", entry.Name(), err)
 		}
-		defer r.Close()
+		defer cfgFile.Close()
 
-		d := yaml.NewDecoder(r)
-		if err = d.Decode(&charCfg); err != nil {
+		var charCfg CharacterCfg
+		if err := yaml.NewDecoder(cfgFile).Decode(&charCfg); err != nil {
 			return fmt.Errorf("error reading %s character config: %w", charConfigPath, err)
 		}
 
-		pickitPath := getAbsPath(filepath.Join("config", entry.Name(), "pickit")) + "\\"
-		rules, err := nip.ReadDir(pickitPath)
+		// Load pickit rules
+		pickitPath := filepath.Join("config", entry.Name(), "pickit")
+		rules, err := nip.ReadDir(pickitPath + "\\")
 		if err != nil {
 			return fmt.Errorf("error reading pickit directory %s: %w", pickitPath, err)
 		}
 
-		if len(charCfg.Game.Runs) > 0 && charCfg.Game.Runs[0] == "leveling" {
-			levelingPickitPath := getAbsPath(filepath.Join("config", entry.Name(), "pickit_leveling")) + "\\"
-			levelingRules, err := nip.ReadDir(levelingPickitPath)
-			if err != nil {
-				return fmt.Errorf("error reading pickit_leveling directory %s: %w", levelingPickitPath, err)
-			}
-			rules = append(rules, levelingRules...)
-		}
-
 		charCfg.Runtime.Rules = rules
-
 		Characters[entry.Name()] = &charCfg
-	}
-	for _, charCfg := range Characters {
-		charCfg.Validate()
 	}
 
 	return nil

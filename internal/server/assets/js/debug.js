@@ -22,7 +22,8 @@ function createTreeView(data, path = '') {
     const fragment = document.createDocumentFragment();
 
     for (const [key, value] of Object.entries(data)) {
-        if (key === 'CollisionGrid') continue; // Skip CollisionGrid entirely
+        // Skip CollisionGrid and other large datasets we want to ignore
+        if (key === 'CollisionGrid') continue;
 
         const node = document.createElement('div');
         node.className = 'tree-node';
@@ -31,7 +32,7 @@ function createTreeView(data, path = '') {
 
         const label = document.createElement('span');
         label.className = 'tree-label';
-        
+
         if (typeof value === 'object' && value !== null) {
             const toggle = document.createElement('span');
             toggle.className = 'tree-toggle';
@@ -40,7 +41,12 @@ function createTreeView(data, path = '') {
 
             const keySpan = document.createElement('span');
             keySpan.className = 'tree-key';
-            keySpan.textContent = key;
+            // Add array length to display if it's an array
+            if (Array.isArray(value)) {
+                keySpan.textContent = `${key} [${value.length}]`;
+            } else {
+                keySpan.textContent = key;
+            }
             label.appendChild(keySpan);
 
             const copyBtn = createCopyButton(currentPath);
@@ -48,15 +54,21 @@ function createTreeView(data, path = '') {
 
             node.appendChild(label);
 
-            if (Array.isArray(value) && value.length > 100) {
-                const arrayPreview = document.createElement('div');
-                arrayPreview.className = 'large-dataset-notice';
-                arrayPreview.textContent = `Array with ${value.length} items`;
-                node.appendChild(arrayPreview);
-
+            // Handle arrays specifically
+            if (Array.isArray(value)) {
                 const childrenContainer = document.createElement('div');
                 childrenContainer.style.display = expandedState[currentPath] !== false ? 'block' : 'none';
-                childrenContainer.appendChild(createTreeView(Object.fromEntries(value.slice(0, 100).entries()), currentPath));
+
+                // Always create a fresh view of the array
+                if (value.length > 100) {
+                    const arrayPreview = document.createElement('div');
+                    arrayPreview.className = 'large-dataset-notice';
+                    arrayPreview.textContent = `Array with ${value.length} items (showing first 100)`;
+                    childrenContainer.appendChild(arrayPreview);
+                    childrenContainer.appendChild(createTreeView(Object.fromEntries(value.slice(0, 100).entries()), currentPath));
+                } else {
+                    childrenContainer.appendChild(createTreeView(Object.fromEntries(value.entries()), currentPath));
+                }
                 node.appendChild(childrenContainer);
             } else {
                 const childrenContainer = document.createElement('div');
@@ -131,15 +143,24 @@ function createCopyButton(path) {
 }
 
 function updateDebugContainer(data) {
-    const newTree = createTreeView(data);
+    // Force clearing any previous data first
     debugContainer.innerHTML = '';
+    previousData = null; // Clear previous data
+
+    // Create and append new tree
+    const newTree = createTreeView(data);
     debugContainer.appendChild(newTree);
+
+    // Store new data after tree is created
     previousData = JSON.parse(JSON.stringify(data));
+
+    // Update UI state
     updateExpandAllButton();
     if (lastSearchTerm) {
         performSearch(lastSearchTerm, false);
     }
 }
+
 
 function updateExpandAllButton() {
     expandAllBtn.querySelector('span').textContent = isAllExpanded ? 'Collapse All' : 'Expand All';
@@ -148,9 +169,29 @@ function updateExpandAllButton() {
 function fetchDebugData() {
     const urlParams = new URLSearchParams(window.location.search);
     const characterName = urlParams.get('characterName') || 'nullref';
-    fetch(`/debug-data?characterName=${characterName}`)
-        .then(response => response.json())
+
+    // Add timestamp to prevent caching
+    const timestamp = new Date().getTime();
+    fetch(`/debug-data?characterName=${characterName}&_t=${timestamp}`, {
+        headers: {
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            'Pragma': 'no-cache',
+            'Expires': '0'
+        },
+        cache: 'no-store'
+    })
+        .then(response => {
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
+            }
+            return response.json();
+        })
         .then(data => {
+            // Log the rules count for debugging
+            if (data.GameData && data.GameData.CharacterCfg && data.GameData.CharacterCfg.Runtime) {
+                console.log('Current rules count:', data.GameData.CharacterCfg.Runtime.Rules.length);
+            }
+
             delete data.CollisionGrid;
             updateDebugContainer(data);
             if (data.PlayerUnit && data.PlayerUnit.Name) {

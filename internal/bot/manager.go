@@ -1,13 +1,18 @@
 package bot
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
 	"unsafe"
 
+	"github.com/hectorgimenez/d2go/pkg/data"
+	"github.com/hectorgimenez/d2go/pkg/nip"
 	"github.com/hectorgimenez/koolo/cmd/koolo/log"
 	"github.com/hectorgimenez/koolo/internal/character"
 	"github.com/hectorgimenez/koolo/internal/config"
@@ -26,6 +31,11 @@ type SupervisorManager struct {
 	supervisors    map[string]Supervisor
 	crashDetectors map[string]*game.CrashDetector
 	eventListener  *event.Listener
+}
+type ConfigReloadResult struct {
+	Success      bool
+	ReloadErrors map[string]error // Per-supervisor errors
+	GlobalError  error            // Critical errors that prevented reload
 }
 
 func NewSupervisorManager(logger *slog.Logger, eventListener *event.Listener) *SupervisorManager {
@@ -356,4 +366,178 @@ func (mng *SupervisorManager) rearrangeWindows() {
 			mng.logger.Debug("Window position of supervisor " + sp.Name() + " was not changed, no free space for it")
 		}
 	}
+}
+
+func (mng *SupervisorManager) ReloadConfig() ConfigReloadResult {
+	result := ConfigReloadResult{
+		Success:      true,
+		ReloadErrors: make(map[string]error),
+	}
+
+	// Load fresh configs
+	if err := config.Load(); err != nil {
+		return ConfigReloadResult{
+			Success:     false,
+			GlobalError: fmt.Errorf("failed to load new configs: %w", err),
+		}
+	}
+
+	// Apply new configs to running supervisors
+	for name, sup := range mng.supervisors {
+		newCfg, exists := config.Characters[name]
+		if !exists {
+			continue
+		}
+
+		ctx := sup.GetContext()
+		if ctx == nil {
+			continue
+		}
+
+		// Preserve runtime data
+		oldRuntimeData := ctx.CharacterCfg.Runtime
+
+		// Update the config
+		*ctx.CharacterCfg = *newCfg
+		ctx.CharacterCfg.Runtime = oldRuntimeData
+	}
+
+	return result
+}
+
+// Add a new applyNewConfig helper function:
+func applyNewConfig(ctx *context.Context, newCfg *config.CharacterCfg) error {
+	var pickitPath string
+	if config.Koolo.CentralizedPickitPath != "" && newCfg.UseCentralizedPickit {
+		pickitPath = config.Koolo.CentralizedPickitPath + "\\"
+		ctx.Logger.Debug("Using centralized pickit path", "path", pickitPath)
+	} else {
+		pickitPath = filepath.Join("config", ctx.Name, "pickit") + "\\"
+		ctx.Logger.Debug("Using local pickit path", "path", pickitPath)
+	}
+
+	// Reload pickit rules
+	rules, err := nip.ReadDir(pickitPath)
+	if err != nil {
+		return fmt.Errorf("failed to reload pickit rules: %w", err)
+	}
+
+	// Load leveling pickit if needed
+	if len(newCfg.Game.Runs) > 0 && newCfg.Game.Runs[0] == "leveling" {
+		levelingPickitPath := filepath.Join("config", ctx.Name, "pickit_leveling") + "\\"
+		levelingRules, err := nip.ReadDir(levelingPickitPath)
+		if err != nil {
+			return fmt.Errorf("failed to reload leveling pickit rules: %w", err)
+		}
+		rules = append(rules, levelingRules...)
+	}
+
+	// Create a completely new config instance
+	cfgCopy := &config.CharacterCfg{
+		MaxGameLength:        newCfg.MaxGameLength,
+		Username:             newCfg.Username,
+		Password:             newCfg.Password,
+		AuthMethod:           newCfg.AuthMethod,
+		AuthToken:            newCfg.AuthToken,
+		Realm:                newCfg.Realm,
+		CharacterName:        newCfg.CharacterName,
+		CommandLineArgs:      newCfg.CommandLineArgs,
+		KillD2OnStop:         newCfg.KillD2OnStop,
+		ClassicMode:          newCfg.ClassicMode,
+		CloseMiniPanel:       newCfg.CloseMiniPanel,
+		UseCentralizedPickit: newCfg.UseCentralizedPickit,
+		Scheduler:            newCfg.Scheduler,
+		Health:               newCfg.Health,
+		Inventory:            newCfg.Inventory,
+		Character: struct {
+			Class         string `yaml:"class"`
+			UseMerc       bool   `yaml:"useMerc"`
+			StashToShared bool   `yaml:"stashToShared"`
+			UseTeleport   bool   `yaml:"useTeleport"`
+			BerserkerBarb struct {
+				FindItemSwitch              bool `yaml:"find_item_switch"`
+				SkipPotionPickupInTravincal bool `yaml:"skip_potion_pickup_in_travincal"`
+			} `yaml:"berserker_barb"`
+			NovaSorceress struct {
+				BossStaticThreshold int `yaml:"boss_static_threshold"`
+			} `yaml:"nova_sorceress"`
+			MosaicSin struct {
+				UseTigerStrike    bool `yaml:"useTigerStrike"`
+				UseCobraStrike    bool `yaml:"useCobraStrike"`
+				UseClawsOfThunder bool `yaml:"useClawsOfThunder"`
+				UseBladesOfIce    bool `yaml:"useBladesOfIce"`
+				UseFistsOfFire    bool `yaml:"useFistsOfFire"`
+			} `yaml:"mosaic_sin"`
+		}{
+			Class:         newCfg.Character.Class,
+			UseMerc:       newCfg.Character.UseMerc,
+			StashToShared: newCfg.Character.StashToShared,
+			UseTeleport:   newCfg.Character.UseTeleport,
+			BerserkerBarb: newCfg.Character.BerserkerBarb,
+			NovaSorceress: newCfg.Character.NovaSorceress,
+			MosaicSin:     newCfg.Character.MosaicSin,
+		},
+		Game:        newCfg.Game,
+		Companion:   newCfg.Companion,
+		Gambling:    newCfg.Gambling,
+		CubeRecipes: newCfg.CubeRecipes,
+		BackToTown:  newCfg.BackToTown,
+		Runtime: struct {
+			Rules nip.Rules   `yaml:"-"`
+			Drops []data.Item `yaml:"-"`
+		}{
+			Rules: rules,
+			Drops: newCfg.Runtime.Drops,
+		},
+	}
+
+	// Log the config values for debugging
+	ctx.Logger.Debug("Config values before update",
+		"currentUseTeleport", ctx.CharacterCfg.Character.UseTeleport,
+		"newUseTeleport", cfgCopy.Character.UseTeleport)
+
+	// Update the context configuration
+	ctx.CharacterCfg = cfgCopy
+
+	ctx.Logger.Debug("Config values after update",
+		"useTeleport", ctx.CharacterCfg.Character.UseTeleport,
+		"ruleCount", len(rules))
+
+	// Also update the global config to ensure it stays in sync
+	config.Characters[ctx.Name] = cfgCopy
+
+	return nil
+}
+
+func validateConfigForSupervisor(sup Supervisor, cfg *config.CharacterCfg) error {
+	if cfg == nil {
+		return errors.New("nil configuration")
+	}
+
+	// Validate critical fields
+	if cfg.CharacterName == "" {
+		return errors.New("character name cannot be empty")
+	}
+
+	// Validate pickit configuration
+	if cfg.UseCentralizedPickit {
+		if config.Koolo.CentralizedPickitPath == "" {
+			return errors.New("centralized pickit enabled but no path configured")
+		}
+		if _, err := os.Stat(config.Koolo.CentralizedPickitPath); os.IsNotExist(err) {
+			return fmt.Errorf("centralized pickit path does not exist: %s", config.Koolo.CentralizedPickitPath)
+		}
+	}
+
+	// Validate health settings
+	if cfg.Health.ChickenAt <= 0 || cfg.Health.ChickenAt > 100 {
+		return fmt.Errorf("invalid chicken health value: %d", cfg.Health.ChickenAt)
+	}
+
+	// Validate that we have at least one run configured
+	if len(cfg.Game.Runs) == 0 {
+		return errors.New("no runs configured")
+	}
+
+	return nil
 }

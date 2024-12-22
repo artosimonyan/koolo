@@ -11,15 +11,15 @@
 <body>
 <main class="container">
     {{ if ne .ErrorMessage "" }}
-    <div class="container">
-        <div class="row">
-            <div class="col">
-                <div class="error-message">
-                    {{ .ErrorMessage }}
+        <div class="container">
+            <div class="row">
+                <div class="col">
+                    <div class="error-message">
+                        {{ .ErrorMessage }}
+                    </div>
                 </div>
             </div>
         </div>
-    </div>
     {{ end }}
     <div class="notification">
         <h2>Settings</h2>
@@ -39,6 +39,14 @@
                             name="d2lodpath"
                             placeholder="E:\games\Diablo II"
                             value="{{.D2LoDPath}}"
+                    />
+                </label>
+                <label>
+                    Centralized Pickit Path (leave blank if you don't want to use a single location for all pickit files)
+                    <input
+                            name="centralized_pickit_path"
+                            placeholder="E:\games\mypickits"
+                            value="{{.CentralizedPickitPath}}"
                     />
                 </label>
                 <label>
@@ -100,7 +108,7 @@
                     />
                     Enabled (Restart required)
                 </label>
-                 <input
+                <input
                         name="discord_admins"
                         placeholder="Discord User IDs who can use bot commands separated by commas"
                         value="{{.Discord.BotAdmins}}"

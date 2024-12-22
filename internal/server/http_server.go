@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"slices"
 	"sort"
 	"strconv"
@@ -26,7 +27,8 @@ import (
 	"github.com/hectorgimenez/d2go/pkg/data/stat"
 	"github.com/hectorgimenez/koolo/internal/bot"
 	"github.com/hectorgimenez/koolo/internal/config"
-	ctx "github.com/hectorgimenez/koolo/internal/context"
+	internalContext "github.com/hectorgimenez/koolo/internal/context"
+
 	"github.com/hectorgimenez/koolo/internal/game"
 	"github.com/hectorgimenez/koolo/internal/utils"
 	"github.com/hectorgimenez/koolo/internal/utils/winproc"
@@ -65,6 +67,10 @@ type WebSocketServer struct {
 	broadcast  chan []byte
 	register   chan *Client
 	unregister chan *Client
+}
+type DebugDataResponse struct {
+	DebugData map[internalContext.Priority]*internalContext.Debug `json:"debugData"`
+	GameData  *game.Data                                          `json:"gameData"`
 }
 
 func NewWebSocketServer() *WebSocketServer {
@@ -265,7 +271,6 @@ func (s *HttpServer) attachProcess(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
-// Add this helper function
 func getRunningProcesses() ([]Process, error) {
 	var processes []Process
 
@@ -417,8 +422,9 @@ func (s *HttpServer) Listen(port int) error {
 	http.HandleFunc("/drops", s.drops)
 	http.HandleFunc("/process-list", s.getProcessList)
 	http.HandleFunc("/attach-process", s.attachProcess)
-	http.HandleFunc("/ws", s.wsServer.HandleWebSocket) // Web socket
-	http.HandleFunc("/initial-data", s.initialData)    // Web socket data
+	http.HandleFunc("/ws", s.wsServer.HandleWebSocket)    // Web socket
+	http.HandleFunc("/initial-data", s.initialData)       // Web socket data
+	http.HandleFunc("/api/reload-config", s.reloadConfig) // New handler
 
 	assets, _ := fs.Sub(assetsFS, "assets")
 	http.Handle("/assets/", http.StripPrefix("/assets/", http.FileServer(http.FS(assets))))
@@ -432,6 +438,21 @@ func (s *HttpServer) Listen(port int) error {
 	}
 
 	return nil
+}
+
+func (s *HttpServer) reloadConfig(w http.ResponseWriter, r *http.Request) {
+	result := s.manager.ReloadConfig()
+
+	response := struct {
+		Success bool   `json:"success"`
+		Message string `json:"message"`
+	}{
+		Success: result.Success,
+		Message: "Config reload completed",
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
 
 func (s *HttpServer) Stop() error {
@@ -462,25 +483,28 @@ func (s *HttpServer) debugData(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	type DebugData struct {
-		DebugData map[ctx.Priority]*ctx.Debug
-		GameData  *game.Data
-	}
-
-	context := s.manager.GetContext(characterName)
-
-	debugData := DebugData{
-		DebugData: context.ContextDebug,
-		GameData:  context.Data,
-	}
-
-	jsonData, err := json.Marshal(debugData)
-	if err != nil {
-		http.Error(w, "Failed to serialize game data", http.StatusInternalServerError)
+	// Get a fresh context instead of potentially cached one
+	ctx := s.manager.GetContext(characterName)
+	if ctx == nil {
+		http.Error(w, "Context not found", http.StatusNotFound)
 		return
 	}
+
+	// Force refresh game data
+	ctx.RefreshGameData()
+
+	debugData := DebugDataResponse{
+		DebugData: ctx.ContextDebug,
+		GameData:  ctx.Data,
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	w.Write(jsonData)
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+	if err := json.NewEncoder(w).Encode(debugData); err != nil {
+		s.logger.Error("Failed to encode debug data", "error", err)
+		http.Error(w, "Failed to encode debug data", http.StatusInternalServerError)
+		return
+	}
 }
 
 func (s *HttpServer) debugHandler(w http.ResponseWriter, r *http.Request) {
@@ -586,35 +610,6 @@ func (s *HttpServer) drops(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func validateSchedulerData(cfg *config.CharacterCfg) error {
-	for day := 0; day < 7; day++ {
-
-		cfg.Scheduler.Days[day].DayOfWeek = day
-
-		// Sort time ranges
-		sort.Slice(cfg.Scheduler.Days[day].TimeRanges, func(i, j int) bool {
-			return cfg.Scheduler.Days[day].TimeRanges[i].Start.Before(cfg.Scheduler.Days[day].TimeRanges[j].Start)
-		})
-
-		daysOfWeek := []string{"Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"}
-
-		// Check for overlapping time ranges
-		for i := 0; i < len(cfg.Scheduler.Days[day].TimeRanges); i++ {
-			if !cfg.Scheduler.Days[day].TimeRanges[i].End.After(cfg.Scheduler.Days[day].TimeRanges[i].Start) {
-				return fmt.Errorf("end time must be after start time for day %s", daysOfWeek[day])
-			}
-
-			if i > 0 {
-				if !cfg.Scheduler.Days[day].TimeRanges[i].Start.After(cfg.Scheduler.Days[day].TimeRanges[i-1].End) {
-					return fmt.Errorf("overlapping time ranges for day %s", daysOfWeek[day])
-				}
-			}
-		}
-	}
-
-	return nil
-}
-
 func (s *HttpServer) config(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
 		err := r.ParseForm()
@@ -627,6 +622,7 @@ func (s *HttpServer) config(w http.ResponseWriter, r *http.Request) {
 		newConfig.FirstRun = false // Disable the welcome assistant
 		newConfig.D2RPath = r.Form.Get("d2rpath")
 		newConfig.D2LoDPath = r.Form.Get("d2lodpath")
+		newConfig.CentralizedPickitPath = r.Form.Get("centralized_pickit_path")
 		newConfig.UseCustomSettings = r.Form.Get("use_custom_settings") == "true"
 		newConfig.GameWindowArrangement = r.Form.Get("game_window_arrangement") == "true"
 		// Debug
@@ -674,306 +670,268 @@ func (s *HttpServer) config(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *HttpServer) characterSettings(w http.ResponseWriter, r *http.Request) {
-	var err error
 	if r.Method == http.MethodPost {
-		err = r.ParseForm()
-		if err != nil {
+		if err := r.ParseForm(); err != nil {
 			s.templates.ExecuteTemplate(w, "character_settings.gohtml", CharacterSettings{
 				ErrorMessage: err.Error(),
 			})
-
 			return
 		}
 
 		supervisorName := r.Form.Get("name")
 		cfg, found := config.Characters[supervisorName]
 		if !found {
-			err = config.CreateFromTemplate(supervisorName)
-			if err != nil {
+			if err := config.CreateFromTemplate(supervisorName); err != nil {
 				s.templates.ExecuteTemplate(w, "character_settings.gohtml", CharacterSettings{
 					ErrorMessage: err.Error(),
 					Supervisor:   supervisorName,
 				})
-
 				return
 			}
 			cfg = config.Characters["template"]
 		}
 
-		cfg.MaxGameLength, _ = strconv.Atoi(r.Form.Get("maxGameLength"))
-		cfg.CharacterName = r.Form.Get("characterName")
-		cfg.CommandLineArgs = r.Form.Get("commandLineArgs")
-		cfg.KillD2OnStop = r.Form.Has("kill_d2_process")
-		cfg.ClassicMode = r.Form.Has("classic_mode")
-		cfg.CloseMiniPanel = r.Form.Has("close_mini_panel")
+		// Create new config while preserving runtime data
+		newConfig := &config.CharacterCfg{}
+		*newConfig = *cfg
 
-		// Bnet config
-		cfg.Username = r.Form.Get("username")
-		cfg.Password = r.Form.Get("password")
-		cfg.Realm = r.Form.Get("realm")
-		cfg.AuthMethod = r.Form.Get("authmethod")
-		cfg.AuthToken = r.Form.Get("AuthToken")
+		// Process all form fields into new config
+		processFormIntoConfig(newConfig, r.Form)
 
-		// Scheduler config
-		cfg.Scheduler.Enabled = r.Form.Has("schedulerEnabled")
-
-		for day := 0; day < 7; day++ {
-
-			starts := r.Form[fmt.Sprintf("scheduler[%d][start][]", day)]
-			ends := r.Form[fmt.Sprintf("scheduler[%d][end][]", day)]
-
-			cfg.Scheduler.Days[day].DayOfWeek = day
-			cfg.Scheduler.Days[day].TimeRanges = make([]config.TimeRange, 0)
-
-			for i := 0; i < len(starts); i++ {
-				start, err := time.Parse("15:04", starts[i])
-				if err != nil {
-					s.templates.ExecuteTemplate(w, "character_settings.gohtml", CharacterSettings{
-						ErrorMessage: fmt.Sprintf("Invalid start time format for day %d: %s", day, starts[i]),
-						// ... (other fields)
-					})
-					return
-				}
-
-				end, err := time.Parse("15:04", ends[i])
-				if err != nil {
-					s.templates.ExecuteTemplate(w, "character_settings.gohtml", CharacterSettings{
-						ErrorMessage: fmt.Sprintf("Invalid end time format for day %d: %s", day, ends[i]),
-					})
-					return
-				}
-
-				cfg.Scheduler.Days[day].TimeRanges = append(cfg.Scheduler.Days[day].TimeRanges, struct {
-					Start time.Time "yaml:\"start\""
-					End   time.Time "yaml:\"end\""
-				}{
-					Start: start,
-					End:   end,
-				})
-			}
-		}
-
-		// Validate scheduler data
-		err := validateSchedulerData(cfg)
-		if err != nil {
+		// Save the config
+		if err := config.SaveSupervisorConfig(supervisorName, newConfig); err != nil {
 			s.templates.ExecuteTemplate(w, "character_settings.gohtml", CharacterSettings{
 				ErrorMessage: err.Error(),
-				// ... (other fields)
+				Supervisor:   supervisorName,
 			})
 			return
 		}
 
-		// Health config
-		cfg.Health.HealingPotionAt, _ = strconv.Atoi(r.Form.Get("healingPotionAt"))
-		cfg.Health.ManaPotionAt, _ = strconv.Atoi(r.Form.Get("manaPotionAt"))
-		cfg.Health.RejuvPotionAtLife, _ = strconv.Atoi(r.Form.Get("rejuvPotionAtLife"))
-		cfg.Health.RejuvPotionAtMana, _ = strconv.Atoi(r.Form.Get("rejuvPotionAtMana"))
-		cfg.Health.ChickenAt, _ = strconv.Atoi(r.Form.Get("chickenAt"))
-		cfg.Character.UseMerc = r.Form.Has("useMerc")
-		cfg.Health.MercHealingPotionAt, _ = strconv.Atoi(r.Form.Get("mercHealingPotionAt"))
-		cfg.Health.MercRejuvPotionAt, _ = strconv.Atoi(r.Form.Get("mercRejuvPotionAt"))
-		cfg.Health.MercChickenAt, _ = strconv.Atoi(r.Form.Get("mercChickenAt"))
-
-		// Character
-		cfg.Character.Class = r.Form.Get("characterClass")
-		cfg.Character.StashToShared = r.Form.Has("characterStashToShared")
-		cfg.Character.UseTeleport = r.Form.Has("characterUseTeleport")
-
-		// Berserker Barb specific options
-		if cfg.Character.Class == "berserker" {
-			cfg.Character.BerserkerBarb.SkipPotionPickupInTravincal = r.Form.Has("barbSkipPotionPickupInTravincal")
-			cfg.Character.BerserkerBarb.FindItemSwitch = r.Form.Has("characterFindItemSwitch")
-		}
-
-		// Nova Sorceress specific options
-		if cfg.Character.Class == "nova" {
-			bossStaticThreshold, err := strconv.Atoi(r.Form.Get("novaBossStaticThreshold"))
-			if err == nil {
-				minThreshold := 65 // Default
-				switch cfg.Game.Difficulty {
-				case difficulty.Normal:
-					minThreshold = 1
-				case difficulty.Nightmare:
-					minThreshold = 33
-				case difficulty.Hell:
-					minThreshold = 50
-				}
-				if bossStaticThreshold >= minThreshold && bossStaticThreshold <= 100 {
-					cfg.Character.NovaSorceress.BossStaticThreshold = bossStaticThreshold
-				} else {
-					cfg.Character.NovaSorceress.BossStaticThreshold = minThreshold
-					s.logger.Warn("Invalid Boss Static Threshold, setting to minimum for difficulty",
-						slog.Int("min", minThreshold),
-						slog.String("difficulty", string(cfg.Game.Difficulty)))
-				}
-			} else {
-				cfg.Character.NovaSorceress.BossStaticThreshold = 65 // Default value
-				s.logger.Warn("Invalid Boss Static Threshold input, setting to default", slog.Int("default", 65))
-			}
-		}
-
-		// Mosaic specific options
-		if cfg.Character.Class == "mosaic" {
-			cfg.Character.MosaicSin.UseTigerStrike = r.Form.Has("mosaicUseTigerStrike")
-			cfg.Character.MosaicSin.UseCobraStrike = r.Form.Has("mosaicUseCobraStrike")
-			cfg.Character.MosaicSin.UseClawsOfThunder = r.Form.Has("mosaicUseClawsOfThunder")
-			cfg.Character.MosaicSin.UseBladesOfIce = r.Form.Has("mosaicUseBladesOfIce")
-			cfg.Character.MosaicSin.UseFistsOfFire = r.Form.Has("mosaicUseFistsOfFire")
-		}
-
-		for y, row := range cfg.Inventory.InventoryLock {
-			for x := range row {
-				if r.Form.Has(fmt.Sprintf("inventoryLock[%d][%d]", y, x)) {
-					cfg.Inventory.InventoryLock[y][x] = 0
-				} else {
-					cfg.Inventory.InventoryLock[y][x] = 1
-				}
-			}
-		}
-
-		for x, value := range r.Form["inventoryBeltColumns[]"] {
-			cfg.Inventory.BeltColumns[x] = value
-		}
-
-		// Game
-		cfg.Game.CreateLobbyGames = r.Form.Has("createLobbyGames")
-		cfg.Game.MinGoldPickupThreshold, _ = strconv.Atoi(r.Form.Get("gameMinGoldPickupThreshold"))
-		cfg.Game.UseCainIdentify = r.Form.Has("useCainIdentify")
-		cfg.Game.Difficulty = difficulty.Difficulty(r.Form.Get("gameDifficulty"))
-		cfg.Game.RandomizeRuns = r.Form.Has("gameRandomizeRuns")
-
-		// Runs specific config
-
-		enabledRuns := make([]config.Run, 0)
-		// we don't like errors, so we ignore them
-		json.Unmarshal([]byte(r.FormValue("gameRuns")), &enabledRuns)
-		cfg.Game.Runs = enabledRuns
-
-		cfg.Game.Cows.OpenChests = r.Form.Has("gameCowsOpenChests")
-
-		cfg.Game.Pit.MoveThroughBlackMarsh = r.Form.Has("gamePitMoveThroughBlackMarsh")
-		cfg.Game.Pit.OpenChests = r.Form.Has("gamePitOpenChests")
-		cfg.Game.Pit.FocusOnElitePacks = r.Form.Has("gamePitFocusOnElitePacks")
-		cfg.Game.Pit.OnlyClearLevel2 = r.Form.Has("gamePitOnlyClearLevel2")
-
-		cfg.Game.Andariel.ClearRoom = r.Form.Has("gameAndarielClearRoom")
-
-		cfg.Game.Pindleskin.SkipOnImmunities = []stat.Resist{}
-		for _, i := range r.Form["gamePindleskinSkipOnImmunities[]"] {
-			cfg.Game.Pindleskin.SkipOnImmunities = append(cfg.Game.Pindleskin.SkipOnImmunities, stat.Resist(i))
-		}
-
-		cfg.Game.StonyTomb.OpenChests = r.Form.Has("gameStonytombOpenChests")
-		cfg.Game.StonyTomb.FocusOnElitePacks = r.Form.Has("gameStonytombFocusOnElitePacks")
-		cfg.Game.AncientTunnels.OpenChests = r.Form.Has("gameAncientTunnelsOpenChests")
-		cfg.Game.AncientTunnels.FocusOnElitePacks = r.Form.Has("gameAncientTunnelsFocusOnElitePacks")
-		cfg.Game.Mausoleum.OpenChests = r.Form.Has("gameMausoleumOpenChests")
-		cfg.Game.Mausoleum.FocusOnElitePacks = r.Form.Has("gameMausoleumFocusOnElitePacks")
-		cfg.Game.DrifterCavern.OpenChests = r.Form.Has("gameDrifterCavernOpenChests")
-		cfg.Game.DrifterCavern.FocusOnElitePacks = r.Form.Has("gameDrifterCavernFocusOnElitePacks")
-		cfg.Game.SpiderCavern.OpenChests = r.Form.Has("gameSpiderCavernOpenChests")
-		cfg.Game.SpiderCavern.FocusOnElitePacks = r.Form.Has("gameSpiderCavernFocusOnElitePacks")
-		cfg.Game.Mephisto.KillCouncilMembers = r.Form.Has("gameMephistoKillCouncilMembers")
-		cfg.Game.Mephisto.OpenChests = r.Form.Has("gameMephistoOpenChests")
-		cfg.Game.Tristram.ClearPortal = r.Form.Has("gameTristramClearPortal")
-		cfg.Game.Tristram.FocusOnElitePacks = r.Form.Has("gameTristramFocusOnElitePacks")
-		cfg.Game.Nihlathak.ClearArea = r.Form.Has("gameNihlathakClearArea")
-
-		cfg.Game.Baal.KillBaal = r.Form.Has("gameBaalKillBaal")
-		cfg.Game.Baal.DollQuit = r.Form.Has("gameBaalDollQuit")
-		cfg.Game.Baal.SoulQuit = r.Form.Has("gameBaalSoulQuit")
-		cfg.Game.Baal.ClearFloors = r.Form.Has("gameBaalClearFloors")
-		cfg.Game.Baal.OnlyElites = r.Form.Has("gameBaalOnlyElites")
-
-		cfg.Game.Eldritch.KillShenk = r.Form.Has("gameEldritchKillShenk")
-		cfg.Game.LowerKurastChest.OpenRacks = r.Form.Has("gameLowerKurastChestOpenRacks")
-		cfg.Game.Diablo.StartFromStar = r.Form.Has("gameDiabloStartFromStar")
-		cfg.Game.Diablo.KillDiablo = r.Form.Has("gameDiabloKillDiablo")
-		cfg.Game.Diablo.FocusOnElitePacks = r.Form.Has("gameDiabloFocusOnElitePacks")
-		cfg.Game.Diablo.DisableItemPickupDuringBosses = r.Form.Has("gameDiabloDisableItemPickupDuringBosses")
-		attackFromDistance, err := strconv.Atoi(r.Form.Get("gameDiabloAttackFromDistance"))
-		if err != nil {
-			s.logger.Warn("Invalid Attack From Distance value, setting to default",
-				slog.String("error", err.Error()),
-				slog.Int("default", 0))
-			cfg.Game.Diablo.AttackFromDistance = 0 // 0 will not reposition
-		} else {
-			if attackFromDistance > 25 {
-				attackFromDistance = 25
-			}
-			cfg.Game.Diablo.AttackFromDistance = attackFromDistance
-		}
-		cfg.Game.Leveling.EnsurePointsAllocation = r.Form.Has("gameLevelingEnsurePointsAllocation")
-		cfg.Game.Leveling.EnsureKeyBinding = r.Form.Has("gameLevelingEnsureKeyBinding")
-
-		// Quests options for Act 1
-		cfg.Game.Quests.ClearDen = r.Form.Has("gameQuestsClearDen")
-		cfg.Game.Quests.RescueCain = r.Form.Has("gameQuestsRescueCain")
-		cfg.Game.Quests.RetrieveHammer = r.Form.Has("gameQuestsRetrieveHammer")
-		// Quests options for Act 2
-		cfg.Game.Quests.KillRadament = r.Form.Has("gameQuestsKillRadament")
-		cfg.Game.Quests.GetCube = r.Form.Has("gameQuestsGetCube")
-		// Quests options for Act 3
-		cfg.Game.Quests.RetrieveBook = r.Form.Has("gameQuestsRetrieveBook")
-		// Quests options for Act 4
-		cfg.Game.Quests.KillIzual = r.Form.Has("gameQuestsKillIzual")
-		// Quests options for Act 5
-		cfg.Game.Quests.KillShenk = r.Form.Has("gameQuestsKillShenk")
-		cfg.Game.Quests.RescueAnya = r.Form.Has("gameQuestsRescueAnya")
-		cfg.Game.Quests.KillAncients = r.Form.Has("gameQuestsKillAncients")
-
-		cfg.Game.TerrorZone.FocusOnElitePacks = r.Form.Has("gameTerrorZoneFocusOnElitePacks")
-		cfg.Game.TerrorZone.SkipOtherRuns = r.Form.Has("gameTerrorZoneSkipOtherRuns")
-
-		cfg.Game.TerrorZone.SkipOnImmunities = []stat.Resist{}
-		for _, i := range r.Form["gameTerrorZoneSkipOnImmunities[]"] {
-			cfg.Game.TerrorZone.SkipOnImmunities = append(cfg.Game.TerrorZone.SkipOnImmunities, stat.Resist(i))
-		}
-
-		tzAreas := make([]area.ID, 0)
-		for _, a := range r.Form["gameTerrorZoneAreas[]"] {
-			ID, _ := strconv.Atoi(a)
-			tzAreas = append(tzAreas, area.ID(ID))
-		}
-		cfg.Game.TerrorZone.Areas = tzAreas
-
-		// Gambling
-		cfg.Gambling.Enabled = r.Form.Has("gamblingEnabled")
-
-		// Cube Recipes
-		cfg.CubeRecipes.Enabled = r.Form.Has("enableCubeRecipes")
-		enabledRecipes := r.Form["enabledRecipes"]
-		cfg.CubeRecipes.EnabledRecipes = enabledRecipes
-		// Companion
-
-		// Companion config
-		cfg.Companion.Leader = r.Form.Has("companionLeader")
-		cfg.Companion.LeaderName = r.Form.Get("companionLeaderName")
-		cfg.Companion.GameNameTemplate = r.Form.Get("companionGameNameTemplate")
-		cfg.Companion.GamePassword = r.Form.Get("companionGamePassword")
-
-		// Back to town config
-		cfg.BackToTown.NoHpPotions = r.Form.Has("noHpPotions")
-		cfg.BackToTown.NoMpPotions = r.Form.Has("noMpPotions")
-		cfg.BackToTown.MercDied = r.Form.Has("mercDied")
-		cfg.BackToTown.EquipmentBroken = r.Form.Has("equipmentBroken")
-
-		config.SaveSupervisorConfig(supervisorName, cfg)
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
 
+	// Handle GET request
 	supervisor := r.URL.Query().Get("supervisor")
 	cfg := config.Characters["template"]
 	if supervisor != "" {
-		cfg = config.Characters[supervisor]
+		if foundCfg, found := config.Characters[supervisor]; found {
+			cfg = foundCfg
+		}
 	}
 
+	prepareTemplateData(cfg, supervisor, s.templates, w)
+}
+func processFormIntoConfig(cfg *config.CharacterCfg, form url.Values) {
+	// Core settings
+	cfg.MaxGameLength, _ = strconv.Atoi(form.Get("maxGameLength"))
+	cfg.CharacterName = form.Get("characterName")
+	cfg.CommandLineArgs = form.Get("commandLineArgs")
+	cfg.KillD2OnStop = form.Has("kill_d2_process")
+	cfg.ClassicMode = form.Has("classic_mode")
+	cfg.CloseMiniPanel = form.Has("close_mini_panel")
+
+	// Authentication settings
+	cfg.Username = form.Get("username")
+	cfg.Password = form.Get("password")
+	cfg.Realm = form.Get("realm")
+	cfg.AuthMethod = form.Get("authmethod")
+	cfg.AuthToken = form.Get("AuthToken")
+
+	// Scheduler settings
+	cfg.Scheduler.Enabled = form.Has("schedulerEnabled")
+	for day := 0; day < 7; day++ {
+		starts := form[fmt.Sprintf("scheduler[%d][start][]", day)]
+		ends := form[fmt.Sprintf("scheduler[%d][end][]", day)]
+		cfg.Scheduler.Days[day].DayOfWeek = day
+		cfg.Scheduler.Days[day].TimeRanges = make([]config.TimeRange, 0)
+		for i := 0; i < len(starts); i++ {
+			if start, err := time.Parse("15:04", starts[i]); err == nil {
+				if end, err := time.Parse("15:04", ends[i]); err == nil {
+					cfg.Scheduler.Days[day].TimeRanges = append(cfg.Scheduler.Days[day].TimeRanges, struct {
+						Start time.Time "yaml:\"start\""
+						End   time.Time "yaml:\"end\""
+					}{Start: start, End: end})
+				}
+			}
+		}
+	}
+
+	// Health settings
+	cfg.Health.HealingPotionAt, _ = strconv.Atoi(form.Get("healingPotionAt"))
+	cfg.Health.ManaPotionAt, _ = strconv.Atoi(form.Get("manaPotionAt"))
+	cfg.Health.RejuvPotionAtLife, _ = strconv.Atoi(form.Get("rejuvPotionAtLife"))
+	cfg.Health.RejuvPotionAtMana, _ = strconv.Atoi(form.Get("rejuvPotionAtMana"))
+	cfg.Health.ChickenAt, _ = strconv.Atoi(form.Get("chickenAt"))
+	cfg.Character.UseMerc = form.Has("useMerc")
+	cfg.Health.MercHealingPotionAt, _ = strconv.Atoi(form.Get("mercHealingPotionAt"))
+	cfg.Health.MercRejuvPotionAt, _ = strconv.Atoi(form.Get("mercRejuvPotionAt"))
+	cfg.Health.MercChickenAt, _ = strconv.Atoi(form.Get("mercChickenAt"))
+
+	// Character settings
+	cfg.Character.Class = form.Get("characterClass")
+	cfg.Character.StashToShared = form.Has("characterStashToShared")
+	cfg.Character.UseTeleport = form.Has("characterUseTeleport")
+
+	// Class-specific settings
+	switch cfg.Character.Class {
+	case "berserker":
+		cfg.Character.BerserkerBarb.SkipPotionPickupInTravincal = form.Has("barbSkipPotionPickupInTravincal")
+		cfg.Character.BerserkerBarb.FindItemSwitch = form.Has("characterFindItemSwitch")
+	case "nova":
+		if threshold, err := strconv.Atoi(form.Get("novaBossStaticThreshold")); err == nil {
+			minThreshold := 65 // Default
+			switch cfg.Game.Difficulty {
+			case difficulty.Normal:
+				minThreshold = 1
+			case difficulty.Nightmare:
+				minThreshold = 33
+			case difficulty.Hell:
+				minThreshold = 50
+			}
+			if threshold >= minThreshold && threshold <= 100 {
+				cfg.Character.NovaSorceress.BossStaticThreshold = threshold
+			} else {
+				cfg.Character.NovaSorceress.BossStaticThreshold = minThreshold
+			}
+		}
+	case "mosaic":
+		cfg.Character.MosaicSin.UseTigerStrike = form.Has("mosaicUseTigerStrike")
+		cfg.Character.MosaicSin.UseCobraStrike = form.Has("mosaicUseCobraStrike")
+		cfg.Character.MosaicSin.UseClawsOfThunder = form.Has("mosaicUseClawsOfThunder")
+		cfg.Character.MosaicSin.UseBladesOfIce = form.Has("mosaicUseBladesOfIce")
+		cfg.Character.MosaicSin.UseFistsOfFire = form.Has("mosaicUseFistsOfFire")
+	}
+
+	// Inventory settings
+	for y, row := range cfg.Inventory.InventoryLock {
+		for x := range row {
+			if form.Has(fmt.Sprintf("inventoryLock[%d][%d]", y, x)) {
+				cfg.Inventory.InventoryLock[y][x] = 0
+			} else {
+				cfg.Inventory.InventoryLock[y][x] = 1
+			}
+		}
+	}
+	for x, value := range form["inventoryBeltColumns[]"] {
+		cfg.Inventory.BeltColumns[x] = value
+	}
+
+	// Game settings
+	cfg.Game.CreateLobbyGames = form.Has("createLobbyGames")
+	cfg.Game.MinGoldPickupThreshold, _ = strconv.Atoi(form.Get("gameMinGoldPickupThreshold"))
+	cfg.UseCentralizedPickit = form.Has("useCentralizedPickit")
+	cfg.Game.UseCainIdentify = form.Has("useCainIdentify")
+	cfg.Game.Difficulty = difficulty.Difficulty(form.Get("gameDifficulty"))
+	cfg.Game.RandomizeRuns = form.Has("gameRandomizeRuns")
+
+	// Parse enabled runs
+	var enabledRuns []config.Run
+	json.Unmarshal([]byte(form.Get("gameRuns")), &enabledRuns)
+	cfg.Game.Runs = enabledRuns
+
+	// Area-specific settings
+	cfg.Game.Cows.OpenChests = form.Has("gameCowsOpenChests")
+	cfg.Game.Pit.MoveThroughBlackMarsh = form.Has("gamePitMoveThroughBlackMarsh")
+	cfg.Game.Pit.OpenChests = form.Has("gamePitOpenChests")
+	cfg.Game.Pit.FocusOnElitePacks = form.Has("gamePitFocusOnElitePacks")
+	cfg.Game.Pit.OnlyClearLevel2 = form.Has("gamePitOnlyClearLevel2")
+	cfg.Game.Andariel.ClearRoom = form.Has("gameAndarielClearRoom")
+	cfg.Game.StonyTomb.OpenChests = form.Has("gameStonytombOpenChests")
+	cfg.Game.StonyTomb.FocusOnElitePacks = form.Has("gameStonytombFocusOnElitePacks")
+	cfg.Game.AncientTunnels.OpenChests = form.Has("gameAncientTunnelsOpenChests")
+	cfg.Game.AncientTunnels.FocusOnElitePacks = form.Has("gameAncientTunnelsFocusOnElitePacks")
+	cfg.Game.Mausoleum.OpenChests = form.Has("gameMausoleumOpenChests")
+	cfg.Game.Mausoleum.FocusOnElitePacks = form.Has("gameMausoleumFocusOnElitePacks")
+	cfg.Game.DrifterCavern.OpenChests = form.Has("gameDrifterCavernOpenChests")
+	cfg.Game.DrifterCavern.FocusOnElitePacks = form.Has("gameDrifterCavernFocusOnElitePacks")
+	cfg.Game.SpiderCavern.OpenChests = form.Has("gameSpiderCavernOpenChests")
+	cfg.Game.SpiderCavern.FocusOnElitePacks = form.Has("gameSpiderCavernFocusOnElitePacks")
+	cfg.Game.Mephisto.KillCouncilMembers = form.Has("gameMephistoKillCouncilMembers")
+	cfg.Game.Mephisto.OpenChests = form.Has("gameMephistoOpenChests")
+	cfg.Game.Tristram.ClearPortal = form.Has("gameTristramClearPortal")
+	cfg.Game.Tristram.FocusOnElitePacks = form.Has("gameTristramFocusOnElitePacks")
+	cfg.Game.Nihlathak.ClearArea = form.Has("gameNihlathakClearArea")
+	cfg.Game.Baal.KillBaal = form.Has("gameBaalKillBaal")
+	cfg.Game.Baal.DollQuit = form.Has("gameBaalDollQuit")
+	cfg.Game.Baal.SoulQuit = form.Has("gameBaalSoulQuit")
+	cfg.Game.Baal.ClearFloors = form.Has("gameBaalClearFloors")
+	cfg.Game.Baal.OnlyElites = form.Has("gameBaalOnlyElites")
+	cfg.Game.Eldritch.KillShenk = form.Has("gameEldritchKillShenk")
+	cfg.Game.LowerKurastChest.OpenRacks = form.Has("gameLowerKurastChestOpenRacks")
+	cfg.Game.Diablo.StartFromStar = form.Has("gameDiabloStartFromStar")
+	cfg.Game.Diablo.KillDiablo = form.Has("gameDiabloKillDiablo")
+	cfg.Game.Diablo.FocusOnElitePacks = form.Has("gameDiabloFocusOnElitePacks")
+	cfg.Game.Diablo.DisableItemPickupDuringBosses = form.Has("gameDiabloDisableItemPickupDuringBosses")
+
+	if attackDist, err := strconv.Atoi(form.Get("gameDiabloAttackFromDistance")); err == nil {
+		if attackDist > 25 {
+			attackDist = 25
+		}
+		cfg.Game.Diablo.AttackFromDistance = attackDist
+	}
+
+	// Quest settings
+	cfg.Game.Quests.ClearDen = form.Has("gameQuestsClearDen")
+	cfg.Game.Quests.RescueCain = form.Has("gameQuestsRescueCain")
+	cfg.Game.Quests.RetrieveHammer = form.Has("gameQuestsRetrieveHammer")
+	cfg.Game.Quests.KillRadament = form.Has("gameQuestsKillRadament")
+	cfg.Game.Quests.GetCube = form.Has("gameQuestsGetCube")
+	cfg.Game.Quests.RetrieveBook = form.Has("gameQuestsRetrieveBook")
+	cfg.Game.Quests.KillIzual = form.Has("gameQuestsKillIzual")
+	cfg.Game.Quests.KillShenk = form.Has("gameQuestsKillShenk")
+	cfg.Game.Quests.RescueAnya = form.Has("gameQuestsRescueAnya")
+	cfg.Game.Quests.KillAncients = form.Has("gameQuestsKillAncients")
+
+	// Terror Zone settings
+	cfg.Game.TerrorZone.FocusOnElitePacks = form.Has("gameTerrorZoneFocusOnElitePacks")
+	cfg.Game.TerrorZone.SkipOtherRuns = form.Has("gameTerrorZoneSkipOtherRuns")
+
+	// Process immunities
+	cfg.Game.Pindleskin.SkipOnImmunities = []stat.Resist{}
+	for _, i := range form["gamePindleskinSkipOnImmunities[]"] {
+		cfg.Game.Pindleskin.SkipOnImmunities = append(cfg.Game.Pindleskin.SkipOnImmunities, stat.Resist(i))
+	}
+
+	cfg.Game.TerrorZone.SkipOnImmunities = []stat.Resist{}
+	for _, i := range form["gameTerrorZoneSkipOnImmunities[]"] {
+		cfg.Game.TerrorZone.SkipOnImmunities = append(cfg.Game.TerrorZone.SkipOnImmunities, stat.Resist(i))
+	}
+
+	// Process Terror Zone areas
+	tzAreas := make([]area.ID, 0)
+	for _, a := range form["gameTerrorZoneAreas[]"] {
+		if ID, err := strconv.Atoi(a); err == nil {
+			tzAreas = append(tzAreas, area.ID(ID))
+		}
+	}
+	cfg.Game.TerrorZone.Areas = tzAreas
+
+	// Gambling settings
+	cfg.Gambling.Enabled = form.Has("gamblingEnabled")
+
+	// Cube Recipes settings
+	cfg.CubeRecipes.Enabled = form.Has("enableCubeRecipes")
+	cfg.CubeRecipes.EnabledRecipes = form["enabledRecipes"]
+
+	// Companion settings
+	cfg.Companion.Leader = form.Has("companionLeader")
+	cfg.Companion.LeaderName = form.Get("companionLeaderName")
+	cfg.Companion.GameNameTemplate = form.Get("companionGameNameTemplate")
+	cfg.Companion.GamePassword = form.Get("companionGamePassword")
+
+	// Back to town settings
+	cfg.BackToTown.NoHpPotions = form.Has("noHpPotions")
+	cfg.BackToTown.NoMpPotions = form.Has("noMpPotions")
+	cfg.BackToTown.MercDied = form.Has("mercDied")
+	cfg.BackToTown.EquipmentBroken = form.Has("equipmentBroken")
+}
+func prepareTemplateData(cfg *config.CharacterCfg, supervisor string, templates *template.Template, w http.ResponseWriter) {
 	enabledRuns := make([]string, 0)
-	// Let's iterate cfg.Game.Runs to preserve current order
 	for _, run := range cfg.Game.Runs {
 		enabledRuns = append(enabledRuns, string(run))
 	}
+
 	disabledRuns := make([]string, 0)
 	for run := range config.AvailableRuns {
 		if !slices.Contains(cfg.Game.Runs, run) {
@@ -982,6 +940,7 @@ func (s *HttpServer) characterSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Strings(disabledRuns)
 
+	// Build available terror zones map
 	availableTZs := make(map[int]string)
 	for _, tz := range area.Areas {
 		if tz.CanBeTerrorized() {
@@ -989,6 +948,7 @@ func (s *HttpServer) characterSettings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Initialize scheduler days if needed
 	if cfg.Scheduler.Days == nil || len(cfg.Scheduler.Days) == 0 {
 		cfg.Scheduler.Days = make([]config.Day, 7)
 		for i := 0; i < 7; i++ {
@@ -998,7 +958,7 @@ func (s *HttpServer) characterSettings(w http.ResponseWriter, r *http.Request) {
 
 	dayNames := []string{"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"}
 
-	s.templates.ExecuteTemplate(w, "character_settings.gohtml", CharacterSettings{
+	templates.ExecuteTemplate(w, "character_settings.gohtml", CharacterSettings{
 		Supervisor:   supervisor,
 		Config:       cfg,
 		DayNames:     dayNames,
